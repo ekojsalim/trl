@@ -18,6 +18,7 @@ import copy
 import inspect
 import textwrap
 from collections import defaultdict
+from contextlib import contextmanager
 from functools import partial
 from typing import Any
 
@@ -40,6 +41,7 @@ from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available
 
 from ...models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
+from ...models.utils import disable_gradient_checkpointing
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.callbacks import SyncRefModelCallback
 from ...trainer.utils import (
@@ -266,6 +268,8 @@ class SDFTTrainer(SelfDistillationMixin, _BaseTrainer):
         if hasattr(model, "warnings_issued"):
             model.warnings_issued["estimate_tokens"] = True
 
+        model = self._prepare_model_for_trainer_wrapping(model)
+
         super().__init__(
             model=model,
             args=args,
@@ -304,6 +308,7 @@ class SDFTTrainer(SelfDistillationMixin, _BaseTrainer):
                 self.teacher_model = copy.deepcopy(student_model)
                 self.teacher_model.requires_grad_(False)
                 self.teacher_model.eval()
+                self.teacher_model = self._prepare_teacher_model_for_trainer_wrapping(self.teacher_model)
                 if self.is_deepspeed_enabled:
                     self.teacher_model = prepare_deepspeed(self.teacher_model, self.accelerator)
                 elif self.is_fsdp_enabled:
@@ -313,6 +318,12 @@ class SDFTTrainer(SelfDistillationMixin, _BaseTrainer):
                 self.add_callback(SyncRefModelCallback(ref_model=self.teacher_model, accelerator=self.accelerator))
 
         self.model_accepts_loss_kwargs = False
+
+    def _prepare_model_for_trainer_wrapping(self, model):
+        return model
+
+    def _prepare_teacher_model_for_trainer_wrapping(self, model):
+        return model
 
     def get_train_dataloader(self):
         if self.train_dataset is None:
@@ -441,7 +452,7 @@ class SDFTTrainer(SelfDistillationMixin, _BaseTrainer):
         attention_mask = torch.cat([teacher_batch["prompt_mask"], completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
 
-        with torch.no_grad():
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if not self.generate_from_teacher and self.args.gradient_accumulation_steps % generate_every != 0:
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
@@ -483,14 +494,28 @@ class SDFTTrainer(SelfDistillationMixin, _BaseTrainer):
             completion_mask = completion_mask * (token_positions >= self.num_loss_tokens_to_skip).long()
             inputs["completion_mask"] = completion_mask
 
-        loss = self._compute_self_distillation_loss(model, inputs)
+        loss = self.args.distillation_weight * self._compute_self_distillation_loss(model, inputs)
         accumulation_scale = self.current_gradient_accumulation_steps if self.model.training else 1.0
         return loss / accumulation_scale
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        if not isinstance(inputs, dict):
+            inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+        return loss.detach(), None, None
+
+    @contextmanager
     def _get_teacher_context_for_self_distillation(self, model):
-        if is_peft_available() and isinstance(self.model, PeftModel):
-            model = self.accelerator.unwrap_model(self.model)
-            if self.args.sync_ref_model and "teacher" in model.peft_config:
-                return use_adapter(model, adapter_name="teacher")
-            return use_adapter(model, adapter_name=None)
-        return super()._get_teacher_context_for_self_distillation(model)
+        with disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            if is_peft_available() and isinstance(self.model, PeftModel):
+                model = self.accelerator.unwrap_model(self.model)
+                if self.args.sync_ref_model and "teacher" in model.peft_config:
+                    with use_adapter(model, adapter_name="teacher"):
+                        yield
+                else:
+                    with use_adapter(model, adapter_name=None):
+                        yield
+            else:
+                yield

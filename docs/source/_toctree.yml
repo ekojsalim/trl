@@ -123,6 +123,8 @@
     title: NeMo Gym
   - local: online_dpo_trainer
     title: Online DPO
+  - local: offline_sdft_trainer
+    title: Offline SDFT
   - local: orpo_trainer
     title: ORPO
   - local: papo_trainer

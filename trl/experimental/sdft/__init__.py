@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .offline_sdft_config import OfflineSDFTConfig
+from .offline_sdft_trainer import OfflineSDFTTrainer, render_offline_sdft_teacher_prompt
 from .sdft_config import SDFTConfig
 from .sdft_trainer import SDFTTrainer
 
 
-__all__ = ["SDFTConfig", "SDFTTrainer"]
+__all__ = [
+    "OfflineSDFTConfig",
+    "OfflineSDFTTrainer",
+    "SDFTConfig",
+    "SDFTTrainer",
+    "render_offline_sdft_teacher_prompt",
+]

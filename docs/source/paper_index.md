@@ -1765,6 +1765,38 @@ Expected dataset columns:
 
 For more details, see the [SDFT Trainer documentation](sdft_trainer).
 
+#### Offline Static-Rollout Self-Distillation
+
+Offline static-rollout self-distillation is available through `OfflineSDFTTrainer` for datasets where the rollout
+completion has already been collected. It uses the same self-distillation core as SDFT/SDPO, but skips online
+generation and reward-function mining. Each row supplies a student prompt, a privileged teacher prompt, and the fixed
+completion trajectory used for prefix-conditioned distillation.
+
+```python
+from trl.experimental.sdft import OfflineSDFTConfig, OfflineSDFTTrainer
+
+training_args = OfflineSDFTConfig(
+    distillation_alpha=1.0,
+    distillation_topk=100,
+    distillation_add_tail=True,
+)
+
+trainer = OfflineSDFTTrainer(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    args=training_args,
+    train_dataset=...,
+)
+trainer.train()
+```
+
+Expected dataset columns:
+
+- `student_prompt`
+- `teacher_prompt`
+- `completion`
+
+For more details, see the [Offline SDFT Trainer documentation](offline_sdft_trainer).
+
 ### Embarrassingly Simple Self-Distillation Improves Code Generation
 
 **📜 Paper**: https://huggingface.co/papers/2604.01193
