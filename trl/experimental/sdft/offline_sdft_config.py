@@ -62,13 +62,9 @@ class OfflineSDFTConfig(SDFTConfig):
             Number of student top tokens to keep for SDPO-style top-k distillation.
         distillation_add_tail (`bool`, *optional*, defaults to `True`):
             Whether to add a tail bucket for non-top-k probability mass.
-        distillation_chunk_size (`int` or `None`, *optional*, defaults to `16`):
-            Number of completion tokens to process at a time for memory-efficient top-k distillation. If `None`, the
-            shared unchunked self-distillation path is used.
-        distillation_chunk_backend (`str`, *optional*, defaults to `"hidden_state"`):
-            Chunking backend for top-k distillation. Supported: `"hidden_state"` patches the model forward and chunks
-            only the LM-head projection and distillation loss after one student and one teacher backbone forward;
-            `"prefix"` recomputes each completion prefix chunk through the full model.
+        distillation_chunk_size (`int` or `None`, *optional*, defaults to `1024`):
+            Number of completion tokens to process at a time for memory-efficient Liger-style top-k distillation. If
+            `None`, the shared unchunked self-distillation path is used.
     """
 
     num_generations: int = field(
@@ -124,14 +120,10 @@ class OfflineSDFTConfig(SDFTConfig):
         metadata={"help": "Whether to add a tail bucket for non-top-k probability mass."},
     )
     distillation_chunk_size: int | None = field(
-        default=16,
+        default=1024,
         metadata={
             "help": "Number of completion tokens to process at a time for memory-efficient top-k distillation."
         },
-    )
-    distillation_chunk_backend: str = field(
-        default="hidden_state",
-        metadata={"help": "Chunking backend for top-k distillation. Supported: `hidden_state`, `prefix`."},
     )
     old_per_token_logps_column: str | None = field(
         default=None,
@@ -145,10 +137,10 @@ class OfflineSDFTConfig(SDFTConfig):
             raise ValueError("num_loss_tokens_to_skip must be non-negative")
         if not self.loss_on_completion_only:
             raise ValueError("OfflineSDFTTrainer only supports `loss_on_completion_only=True`.")
+        if self.sync_ref_model:
+            raise ValueError("OfflineSDFTTrainer does not support `sync_ref_model=True`.")
         if self.distillation_chunk_size is not None and self.distillation_chunk_size <= 0:
             raise ValueError("distillation_chunk_size must be positive when provided")
-        if self.distillation_chunk_backend not in {"hidden_state", "prefix"}:
-            raise ValueError("distillation_chunk_backend must be one of: 'hidden_state', 'prefix'")
         required_template_fields = ["{prompt}", "{feedback}", "{correct_solution}"]
         if any(field_name not in self.teacher_prompt_template for field_name in required_template_fields):
             raise ValueError(

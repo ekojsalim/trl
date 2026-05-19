@@ -81,23 +81,35 @@ OfflineSDFTConfig(
     distillation_alpha=1.0,
     distillation_topk=100,
     distillation_add_tail=True,
-    distillation_chunk_size=16,
-    distillation_chunk_backend="hidden_state",
+    distillation_chunk_size=1024,
 )
 ```
 
-By default, chunked top-k distillation patches the model forward before Accelerate, FSDP, or DeepSpeed wrapping. It
-runs one student backbone forward and one teacher backbone forward, then projects hidden states through the LM head in
-`distillation_chunk_size` completion-token chunks inside the wrapped forwards. This avoids materializing full
-completion-length student and teacher logit tensors while keeping sharded-parameter handling on the normal
-model-forward path. The student chunk projection/loss is checkpointed during training.
+Chunked top-k distillation patches the model forward before Accelerate, FSDP, or DeepSpeed wrapping. It runs one
+student backbone forward and one teacher backbone forward, then projects hidden states through the LM head in
+`distillation_chunk_size` completion-token chunks. The student projection uses a Liger-style custom autograd function,
+which avoids saving full-vocab logits and computes the projection gradient directly in backward. The teacher projection
+remains no-grad and chunked.
 
-Set `distillation_chunk_backend="prefix"` to use the simpler fallback backend, which recomputes each completion prefix
-through the full model per chunk. That path uses less custom model plumbing, but is much more compute-heavy.
+Under FSDP2 with `fsdp_reshard_after_forward=true`, this path gathers and caches the frozen LM head across the training
+step so the custom backward does not read a resharded parameter. This currently supports the PEFT-style frozen LM-head
+setting. Offline SDFT does not support `sync_ref_model=True`; the teacher is the current model evaluated under the
+teacher prompt.
 
-Under FSDP2, `fsdp_reshard_after_forward=false` avoids repeated `lm_head.weight` all-gathers during backward for the
-hidden-state backend. If resharding must stay enabled, increasing `distillation_chunk_size` reduces those all-gathers
-at the cost of higher temporary logits memory.
+## Logged Metrics
+
+Offline SDFT logs the masked mean `offline_sdft/distillation_loss`, along with distribution diagnostics for the fixed
+completion trajectory:
+
+- `offline_sdft/student_topk_mass`
+- `offline_sdft/teacher_topk_mass`
+- `offline_sdft/student_entropy`
+- `offline_sdft/teacher_entropy`
+
+When `old_per_token_logps_column` is provided and importance-sampling clipping is enabled, it also logs:
+
+- `offline_sdft/is_ratio_mean`
+- `offline_sdft/is_clipped_frac`
 
 Static completions append the tokenizer EOS token by default after text or chat-template rendering. Set
 `append_eos_token=False` if the dataset already contains exactly the token sequence to score.

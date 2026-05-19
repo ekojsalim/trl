@@ -15,16 +15,15 @@
 from __future__ import annotations
 
 import types
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import accelerate
 import torch
-from accelerate.logging import get_logger
 from datasets import Dataset, IterableDataset
 from packaging.version import Version
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, TrainerCallback
 from transformers.utils import is_peft_available
 
@@ -41,14 +40,106 @@ if is_peft_available():
     from peft.peft_model import PeftModel
 
 
-logger = get_logger(__name__)
-
-
 @dataclass
 class _OfflineSDFTChunkedOutput:
     topk_log_probs: torch.Tensor
     topk_indices: torch.Tensor | None = None
     per_token_logps: torch.Tensor | None = None
+
+
+class _OfflineSDFTStudentTopKProjection(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        lm_head_bias: torch.Tensor | None,
+        completion_ids: torch.Tensor,
+        topk: int,
+        logit_scale: float,
+        final_logit_softcapping: float | None,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = _offline_sdft_project_logits(
+            hidden_states,
+            lm_head_weight,
+            lm_head_bias,
+            logit_scale,
+            final_logit_softcapping,
+            temperature,
+        )
+        logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+        topk_logits, topk_indices = torch.topk(logits, k=topk, dim=-1)
+        topk_log_probs = topk_logits - logsumexp
+        per_token_logps = (torch.gather(logits, dim=-1, index=completion_ids.unsqueeze(-1)) - logsumexp).squeeze(-1)
+
+        if lm_head_bias is None:
+            ctx.save_for_backward(hidden_states, lm_head_weight, completion_ids, topk_indices)
+        else:
+            ctx.save_for_backward(hidden_states, lm_head_weight, lm_head_bias, completion_ids, topk_indices)
+        ctx.has_bias = lm_head_bias is not None
+        ctx.logit_scale = logit_scale
+        ctx.final_logit_softcapping = final_logit_softcapping
+        ctx.temperature = temperature
+        return topk_log_probs, topk_indices, per_token_logps
+
+    @staticmethod
+    def backward(ctx, grad_topk_log_probs, grad_topk_indices, grad_per_token_logps):
+        if ctx.has_bias:
+            hidden_states, lm_head_weight, lm_head_bias, completion_ids, topk_indices = ctx.saved_tensors
+        else:
+            hidden_states, lm_head_weight, completion_ids, topk_indices = ctx.saved_tensors
+            lm_head_bias = None
+
+        hidden_states_f = hidden_states.float()
+        lm_head_weight_f = lm_head_weight.float()
+        pre_scale_logits = hidden_states_f @ lm_head_weight_f.t()
+        if lm_head_bias is not None:
+            pre_scale_logits = pre_scale_logits + lm_head_bias.float()
+
+        scaled_logits = pre_scale_logits * ctx.logit_scale if ctx.logit_scale != 1.0 else pre_scale_logits
+        if ctx.final_logit_softcapping is not None:
+            softcap_input = scaled_logits / ctx.final_logit_softcapping
+            projected_logits = ctx.final_logit_softcapping * torch.tanh(softcap_input)
+            softcap_grad = 1 - torch.tanh(softcap_input).pow(2)
+        else:
+            projected_logits = scaled_logits
+            softcap_grad = None
+        logits = projected_logits / ctx.temperature
+        probs = torch.softmax(logits, dim=-1)
+
+        grad_logits = torch.zeros_like(logits)
+        if grad_topk_log_probs is not None:
+            grad_topk_log_probs = grad_topk_log_probs.float()
+            grad_logits.scatter_add_(dim=-1, index=topk_indices, src=grad_topk_log_probs)
+            grad_logits = grad_logits - probs * grad_topk_log_probs.sum(dim=-1, keepdim=True)
+        if grad_per_token_logps is not None:
+            grad_per_token_logps = grad_per_token_logps.float().unsqueeze(-1)
+            grad_logits.scatter_add_(dim=-1, index=completion_ids.unsqueeze(-1), src=grad_per_token_logps)
+            grad_logits = grad_logits - probs * grad_per_token_logps
+
+        grad_projected_logits = grad_logits / ctx.temperature
+        if softcap_grad is not None:
+            grad_scaled_logits = grad_projected_logits * softcap_grad
+        else:
+            grad_scaled_logits = grad_projected_logits
+        grad_pre_scale_logits = grad_scaled_logits * ctx.logit_scale
+
+        needs_hidden_grad, needs_weight_grad, needs_bias_grad = ctx.needs_input_grad[:3]
+        grad_hidden_states = grad_pre_scale_logits @ lm_head_weight_f if needs_hidden_grad else None
+        grad_lm_head_weight = grad_pre_scale_logits.t() @ hidden_states_f if needs_weight_grad else None
+        grad_lm_head_bias = grad_pre_scale_logits.sum(dim=0) if needs_bias_grad and lm_head_bias is not None else None
+
+        return (
+            grad_hidden_states.to(hidden_states.dtype) if grad_hidden_states is not None else None,
+            grad_lm_head_weight.to(lm_head_weight.dtype) if grad_lm_head_weight is not None else None,
+            grad_lm_head_bias.to(lm_head_bias.dtype) if grad_lm_head_bias is not None else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def _offline_sdft_project_logits(
@@ -159,38 +250,37 @@ def _patch_offline_sdft_chunked_forward(
         hidden_states = hidden_states[flat_mask]
 
         lm_head = self.get_output_embeddings()
-        lm_head_bias = getattr(lm_head, "bias", None)
+        lm_head_weight = getattr(self, "_offline_sdft_lm_head_weight", lm_head.weight)
+        lm_head_bias = getattr(self, "_offline_sdft_lm_head_bias", getattr(lm_head, "bias", None))
 
         if hidden_states.size(0) == 0:
             topk = offline_sdft_topk or 1
-            topk = min(topk, lm_head.weight.size(0))
-            topk_log_probs = lm_head.weight.new_zeros((batch_size, completion_length, topk))
+            topk = min(topk, lm_head_weight.size(0))
+            topk_log_probs = lm_head_weight.new_zeros((batch_size, completion_length, topk))
             return _OfflineSDFTChunkedOutput(topk_log_probs=topk_log_probs)
 
         if offline_sdft_topk_indices is None:
-            topk = min(offline_sdft_topk, lm_head.weight.size(0))
+            topk = min(offline_sdft_topk, lm_head_weight.size(0))
             completion_ids = offline_sdft_completion_ids.reshape(-1)[flat_mask]
             topk_log_probs_chunks = []
             topk_indices_chunks = []
             per_token_logps_chunks = []
             for start in range(0, hidden_states.size(0), chunk_size):
                 if self.training and torch.is_grad_enabled():
-                    topk_log_probs, topk_indices, per_token_logps = checkpoint(
-                        _offline_sdft_student_chunk,
+                    topk_log_probs, topk_indices, per_token_logps = _OfflineSDFTStudentTopKProjection.apply(
                         hidden_states[start : start + chunk_size],
-                        lm_head.weight,
+                        lm_head_weight,
                         lm_head_bias,
                         completion_ids[start : start + chunk_size],
                         topk,
                         logit_scale,
                         final_logit_softcapping,
                         temperature,
-                        use_reentrant=False,
                     )
                 else:
                     topk_log_probs, topk_indices, per_token_logps = _offline_sdft_student_chunk(
                         hidden_states[start : start + chunk_size],
-                        lm_head.weight,
+                        lm_head_weight,
                         lm_head_bias,
                         completion_ids[start : start + chunk_size],
                         topk,
@@ -224,7 +314,7 @@ def _patch_offline_sdft_chunked_forward(
         for start in range(0, hidden_states.size(0), chunk_size):
             topk_log_probs = _offline_sdft_teacher_chunk(
                 hidden_states[start : start + chunk_size],
-                lm_head.weight,
+                lm_head_weight,
                 lm_head_bias,
                 topk_indices[start : start + chunk_size],
                 logit_scale,
@@ -326,9 +416,10 @@ class OfflineSDFTTrainer(SDFTTrainer):
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             args = OfflineSDFTConfig(output_dir=f"{model_name.split('/')[-1]}-OfflineSDFT")
+        if args.sync_ref_model:
+            raise ValueError("OfflineSDFTTrainer does not support `sync_ref_model=True`.")
 
         self._offline_sdft_uses_patched_forward = False
-        self._warned_hidden_state_chunk_backend_fallback = False
         self._offline_sdft_args = args
 
         super().__init__(
@@ -341,12 +432,10 @@ class OfflineSDFTTrainer(SDFTTrainer):
             optimizers=optimizers,
             peft_config=peft_config,
         )
-        self._maybe_warn_sharded_chunked_backend()
 
     def _should_patch_chunked_topk_distillation(self) -> bool:
         return (
-            self._offline_sdft_args.distillation_chunk_backend == "hidden_state"
-            and self._offline_sdft_args.distillation_chunk_size is not None
+            self._offline_sdft_args.distillation_chunk_size is not None
             and self._offline_sdft_args.distillation_topk is not None
         )
 
@@ -367,25 +456,84 @@ class OfflineSDFTTrainer(SDFTTrainer):
     def _prepare_model_for_trainer_wrapping(self, model):
         return self._patch_chunked_topk_distillation_model(model)
 
-    def _prepare_teacher_model_for_trainer_wrapping(self, model):
-        self._patch_chunked_topk_distillation_model(model, force=True)
-        return model
+    def _get_offline_sdft_patched_model(self, model):
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        if is_peft_available() and isinstance(unwrapped_model, PeftModel):
+            return unwrapped_model.get_base_model()
+        return unwrapped_model
 
-    def _maybe_warn_sharded_chunked_backend(self):
+    @contextmanager
+    def _cache_chunked_lm_head_for_fsdp2(self, model):
         if not self._offline_sdft_uses_patched_forward:
+            yield
             return
-        if (
+        if not (
             Version(accelerate.__version__) >= Version("1.6.0")
             and self.accelerator.state.is_fsdp2
             and self.accelerator.state.fsdp_plugin.reshard_after_forward
         ):
-            logger.warning(
-                "`distillation_chunk_backend='hidden_state'` under FSDP2 with `reshard_after_forward=True` can be "
-                "slower than necessary due to per-chunk all-gathers of `lm_head.weight`. Consider passing "
-                "`--fsdp_reshard_after_forward false` to `accelerate launch` (or equivalent in your FSDP config). "
-                "If you need to keep resharding enabled, increasing `distillation_chunk_size` reduces the number of "
-                "LM-head all-gathers at the cost of higher temporary logits memory."
+            yield
+            return
+
+        target_model = self._get_offline_sdft_patched_model(model)
+        lm_head = target_model.get_output_embeddings()
+        if lm_head.weight.requires_grad or (lm_head.bias is not None and lm_head.bias.requires_grad):
+            raise NotImplementedError(
+                "OfflineSDFTTrainer's chunked top-k path with FSDP2 `reshard_after_forward=True` currently supports "
+                "only frozen LM-head parameters. This matches the PEFT setting where adapters are trainable and the "
+                "base LM head is frozen."
             )
+
+        from torch.distributed.tensor import DTensor
+
+        weight = lm_head.weight.full_tensor() if isinstance(lm_head.weight, DTensor) else lm_head.weight
+        bias = None
+        if lm_head.bias is not None:
+            bias = lm_head.bias.full_tensor() if isinstance(lm_head.bias, DTensor) else lm_head.bias
+
+        target_model._offline_sdft_lm_head_weight = weight
+        target_model._offline_sdft_lm_head_bias = bias
+        try:
+            yield
+        finally:
+            del target_model._offline_sdft_lm_head_weight
+            del target_model._offline_sdft_lm_head_bias
+
+    def _get_zero3_lm_head_gather_ctx(self, model):
+        if not self._offline_sdft_uses_patched_forward:
+            return nullcontext()
+
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        if deepspeed_plugin is None or deepspeed_plugin.zero_stage != 3:
+            return nullcontext()
+
+        import deepspeed
+
+        target_model = self._get_offline_sdft_patched_model(model)
+        lm_head = target_model.get_output_embeddings()
+        params = [lm_head.weight]
+        if lm_head.bias is not None:
+            params.append(lm_head.bias)
+        return deepspeed.zero.GatheredParameters(params, modifier_rank=None)
+
+    @contextmanager
+    def _get_chunked_lm_head_gather_ctx(self, model):
+        with self._get_zero3_lm_head_gather_ctx(model):
+            with self._cache_chunked_lm_head_for_fsdp2(model):
+                yield
+
+    def training_step(self, model, inputs, num_items_in_batch):
+        with self._get_chunked_lm_head_gather_ctx(model):
+            return super().training_step(model, inputs, num_items_in_batch)
+
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        mode = "train" if self.model.training else "eval"
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}
+        if mode == "eval":
+            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+
+        super().log({**logs, **metrics}, start_time)
+        self._metrics[mode].clear()
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
@@ -580,22 +728,27 @@ class OfflineSDFTTrainer(SDFTTrainer):
             and (self.args.full_logit_distillation or self._allow_topk_without_full_logit_distillation())
         )
 
-    def _use_hidden_state_chunk_backend(self) -> bool:
-        if self.args.distillation_chunk_backend != "hidden_state":
-            return False
+    @staticmethod
+    def _entropy_from_log_probs(log_probs: torch.Tensor) -> torch.Tensor:
+        probs = log_probs.exp()
+        return -(torch.where(probs > 0, probs * log_probs, torch.zeros_like(probs))).sum(dim=-1)
 
-        if self._offline_sdft_uses_patched_forward:
-            return True
+    def _log_self_distillation_metric(self, mode: str, metric_name: str, value: float) -> None:
+        self._metrics[mode][f"offline_sdft/{metric_name}"].append(value)
 
-        if not self._warned_hidden_state_chunk_backend_fallback:
-            logger.warning(
-                "`distillation_chunk_backend='hidden_state'` requires the Offline SDFT chunked forward patch. Falling "
-                "back to `distillation_chunk_backend='prefix'` for this run."
-            )
-            self._warned_hidden_state_chunk_backend_fallback = True
-        return False
+    def _log_offline_sdft_masked_metric(
+        self,
+        mode: str,
+        metric_name: str,
+        values: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> None:
+        values = values.detach().float()
+        response_mask = response_mask.detach().to(values.dtype)
+        mean_value = (values * response_mask).sum() / response_mask.sum().clamp(min=1.0)
+        self._log_self_distillation_metric(mode, metric_name, self.accelerator.gather(mean_value).mean().item())
 
-    def _compute_hidden_state_topk_distillation_loss(
+    def _compute_chunked_topk_distillation_loss(
         self,
         model,
         inputs: dict[str, Any],
@@ -630,197 +783,57 @@ class OfflineSDFTTrainer(SDFTTrainer):
 
         topk_student_log_probs = student_output.topk_log_probs
         topk_teacher_log_probs = teacher_output.topk_log_probs
+        mode = "train" if model.training else "eval"
+        self._log_offline_sdft_masked_metric(
+            mode,
+            "student_topk_mass",
+            torch.exp(torch.logsumexp(topk_student_log_probs, dim=-1)),
+            response_mask,
+        )
+        self._log_offline_sdft_masked_metric(
+            mode,
+            "teacher_topk_mass",
+            torch.exp(torch.logsumexp(topk_teacher_log_probs, dim=-1)),
+            response_mask,
+        )
+
         if self.args.distillation_add_tail:
             topk_student_log_probs = self._add_tail(topk_student_log_probs)
             topk_teacher_log_probs = self._add_tail(topk_teacher_log_probs)
         else:
             topk_student_log_probs = self._renorm_topk_log_probs(topk_student_log_probs)
             topk_teacher_log_probs = self._renorm_topk_log_probs(topk_teacher_log_probs)
+        self._log_offline_sdft_masked_metric(
+            mode,
+            "student_entropy",
+            self._entropy_from_log_probs(topk_student_log_probs),
+            response_mask,
+        )
+        self._log_offline_sdft_masked_metric(
+            mode,
+            "teacher_entropy",
+            self._entropy_from_log_probs(topk_teacher_log_probs),
+            response_mask,
+        )
 
         per_token_loss = self._compute_divergence(
             topk_student_log_probs, topk_teacher_log_probs, self.args.distillation_alpha
         )
         old_per_token_logps = inputs.get("old_per_token_logps")
         if self.args.distillation_is_clip is not None and old_per_token_logps is not None:
-            per_token_loss = self._apply_importance_sampling_clipping(
-                per_token_loss,
-                student_output.per_token_logps.detach(),
-                old_per_token_logps,
-                self.args.distillation_is_clip,
+            negative_approx_kl = (student_output.per_token_logps.detach() - old_per_token_logps).clamp(
+                min=-20.0, max=20.0
             )
-
-        return self._finish_chunked_self_distillation_loss(model, per_token_loss, response_mask)
-
-    def _get_completion_chunk_logits(
-        self,
-        model,
-        prompt_ids: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        completion_ids: torch.Tensor,
-        completion_mask: torch.Tensor,
-        start: int,
-        end: int,
-    ) -> torch.Tensor:
-        chunk_len = end - start
-        input_ids = torch.cat([prompt_ids, completion_ids[:, :end]], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask[:, :end]], dim=1)
-        model_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "use_cache": False,
-        }
-        if "logits_to_keep" in self.model_kwarg_keys:
-            model_inputs["logits_to_keep"] = chunk_len + 1
-        logits = model(**model_inputs).logits
-        logits = logits[:, :-1, :]
-        logits = logits[:, -chunk_len:, :].contiguous()
-        return logits / self.temperature
-
-    def _compute_topk_distillation_chunk(
-        self,
-        model,
-        prompt_ids: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        completion_ids: torch.Tensor,
-        completion_mask: torch.Tensor,
-        teacher_input_ids: torch.Tensor,
-        teacher_attention_mask: torch.Tensor,
-        old_per_token_logps: torch.Tensor | None,
-        start: int,
-        end: int,
-    ) -> torch.Tensor:
-        student_logits = self._get_completion_chunk_logits(
-            model,
-            prompt_ids,
-            prompt_mask,
-            completion_ids,
-            completion_mask,
-            start,
-            end,
-        )
-        student_logsumexp = torch.logsumexp(student_logits, dim=-1, keepdim=True)
-        topk = min(self.args.distillation_topk, student_logits.size(-1))
-        topk_student_logits, topk_indices = torch.topk(student_logits, k=topk, dim=-1)
-        topk_student_log_probs = topk_student_logits - student_logsumexp
-
-        teacher_model = self._get_teacher_model_for_self_distillation(model)
-        teacher_prompt_len = teacher_input_ids.size(1) - completion_ids.size(1)
-        teacher_prompt_ids = teacher_input_ids[:, :teacher_prompt_len]
-        teacher_prompt_mask = teacher_attention_mask[:, :teacher_prompt_len]
-        with torch.no_grad(), self._get_teacher_context_for_self_distillation(model):
-            teacher_logits = self._get_completion_chunk_logits(
-                teacher_model,
-                teacher_prompt_ids,
-                teacher_prompt_mask,
-                completion_ids,
-                completion_mask,
-                start,
-                end,
+            is_ratio = torch.exp(negative_approx_kl)
+            self._log_offline_sdft_masked_metric(mode, "is_ratio_mean", is_ratio, response_mask)
+            self._log_offline_sdft_masked_metric(
+                mode,
+                "is_clipped_frac",
+                (is_ratio > self.args.distillation_is_clip).float(),
+                response_mask,
             )
-            teacher_logsumexp = torch.logsumexp(teacher_logits, dim=-1, keepdim=True)
-            topk_teacher_logits = torch.gather(teacher_logits, dim=-1, index=topk_indices)
-            topk_teacher_log_probs = topk_teacher_logits - teacher_logsumexp
+            per_token_loss = per_token_loss * is_ratio.clamp(max=self.args.distillation_is_clip)
 
-            if self.args.distillation_add_tail:
-                topk_teacher_log_probs = self._add_tail(topk_teacher_log_probs)
-            else:
-                topk_teacher_log_probs = self._renorm_topk_log_probs(topk_teacher_log_probs)
-
-        if self.args.distillation_add_tail:
-            topk_student_log_probs = self._add_tail(topk_student_log_probs)
-        else:
-            topk_student_log_probs = self._renorm_topk_log_probs(topk_student_log_probs)
-
-        per_token_loss = self._compute_divergence(
-            topk_student_log_probs, topk_teacher_log_probs, self.args.distillation_alpha
-        )
-
-        if self.args.distillation_is_clip is not None:
-            if old_per_token_logps is not None:
-                with torch.no_grad():
-                    idx = completion_ids[:, start:end].unsqueeze(-1)
-                    student_per_token_logps = (
-                        torch.gather(student_logits, dim=-1, index=idx) - student_logsumexp
-                    ).squeeze(-1)
-                per_token_loss = self._apply_importance_sampling_clipping(
-                    per_token_loss,
-                    student_per_token_logps,
-                    old_per_token_logps[:, start:end],
-                    self.args.distillation_is_clip,
-                )
-
-        return per_token_loss
-
-    def _compute_prefix_topk_distillation_loss(
-        self,
-        model,
-        inputs: dict[str, Any],
-        response_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        logits_to_keep = completion_ids.size(1)
-
-        teacher_input_ids = inputs["teacher_input_ids"]
-        teacher_attention_mask = inputs["teacher_attention_mask"]
-        old_per_token_logps = inputs.get("old_per_token_logps")
-        per_token_loss_chunks = []
-        chunk_size = self.args.distillation_chunk_size
-        for start in range(0, logits_to_keep, chunk_size):
-            end = min(start + chunk_size, logits_to_keep)
-            chunk_response_mask = response_mask[:, start:end]
-            if chunk_response_mask.sum() == 0:
-                per_token_loss_chunks.append(
-                    chunk_response_mask.new_zeros(chunk_response_mask.shape, dtype=torch.float32)
-                )
-                continue
-
-            def chunk_loss_fn(
-                prompt_ids,
-                prompt_mask,
-                completion_ids,
-                completion_mask,
-                teacher_input_ids,
-                teacher_attention_mask,
-                chunk_start=start,
-                chunk_end=end,
-            ):
-                return self._compute_topk_distillation_chunk(
-                    model,
-                    prompt_ids,
-                    prompt_mask,
-                    completion_ids,
-                    completion_mask,
-                    teacher_input_ids,
-                    teacher_attention_mask,
-                    old_per_token_logps,
-                    chunk_start,
-                    chunk_end,
-                )
-
-            if model.training:
-                per_token_loss_chunk = checkpoint(
-                    chunk_loss_fn,
-                    prompt_ids,
-                    prompt_mask,
-                    completion_ids,
-                    completion_mask,
-                    teacher_input_ids,
-                    teacher_attention_mask,
-                    use_reentrant=False,
-                )
-            else:
-                per_token_loss_chunk = chunk_loss_fn(
-                    prompt_ids,
-                    prompt_mask,
-                    completion_ids,
-                    completion_mask,
-                    teacher_input_ids,
-                    teacher_attention_mask,
-                )
-            per_token_loss_chunks.append(per_token_loss_chunk)
-
-        per_token_loss = torch.cat(per_token_loss_chunks, dim=1)
         return self._finish_chunked_self_distillation_loss(model, per_token_loss, response_mask)
 
     def _finish_chunked_self_distillation_loss(
@@ -832,12 +845,7 @@ class OfflineSDFTTrainer(SDFTTrainer):
         loss = self._aggregate_self_distillation_loss(per_token_loss, response_mask)
 
         mode = "train" if model.training else "eval"
-        mean_distill_loss = (per_token_loss * response_mask).sum() / response_mask.sum().clamp(min=1.0)
-        self._log_self_distillation_metric(
-            mode,
-            "distillation_loss",
-            self.accelerator.gather(mean_distill_loss).mean().item(),
-        )
+        self._log_offline_sdft_masked_metric(mode, "distillation_loss", per_token_loss, response_mask)
 
         return loss
 
@@ -884,9 +892,9 @@ class OfflineSDFTTrainer(SDFTTrainer):
         if response_mask.sum() == 0:
             return self._compute_zero_self_distillation_loss(model, inputs)
 
-        if self._use_hidden_state_chunk_backend():
-            return self._compute_hidden_state_topk_distillation_loss(model, inputs, response_mask)
-        return self._compute_prefix_topk_distillation_loss(model, inputs, response_mask)
+        if not self._offline_sdft_uses_patched_forward:
+            raise RuntimeError("OfflineSDFTTrainer requires its chunked top-k forward patch before training.")
+        return self._compute_chunked_topk_distillation_loss(model, inputs, response_mask)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
