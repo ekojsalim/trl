@@ -236,6 +236,12 @@ def _patch_offline_sdft_chunked_forward(
             return self._offline_sdft_original_forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
         kwargs.pop("use_cache", None)
+        if (
+            "mm_token_type_ids" not in kwargs
+            and input_ids is not None
+            and getattr(getattr(self, "config", None), "model_type", None) == "gemma4"
+        ):
+            kwargs["mm_token_type_ids"] = torch.zeros_like(input_ids)
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **kwargs)
         hidden_states = outputs.last_hidden_state[:, :-1, :]
         hidden_states = hidden_states[:, -offline_sdft_logits_to_keep:, :].contiguous()
